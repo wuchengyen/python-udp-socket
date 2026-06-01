@@ -1,276 +1,290 @@
 import socket
-import sys
-import os
+import threading
+import random
 import time
+import os
 
-# =====================================================
-# 常數設定
-# SERVER_PORT : 伺服器監聽的 UDP 埠號
-# BUFFER_SIZE : 每次接收資料的緩衝區大小（位元組）
-# =====================================================
+def print_tcp_socket_info(client_socket, addr):
+    """提取並印出作業系統底層的 TCP 連線資訊"""
+    try:
+        # 1. 取得連線雙方的 IP 與 Port (TCP 連線四元組)
+        remote_ip, remote_port = addr
+        local_ip, local_port = client_socket.getsockname()
+
+        # 2. 取得作業系統為這個 TCP 連線分配的接收與發送緩衝區大小 (Byte)
+        recv_buf = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        send_buf = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+
+        # 3. 檢查 Nagle 演算法狀態 (TCP_NODELAY)
+        try:
+            nodelay = client_socket.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+            nodelay_status = "開啟 (即時傳送，適合遊戲)" if nodelay else "關閉 (合併傳送，節省頻寬)"
+        except:
+            nodelay_status = "未知"
+
+        print("\n=== 📡 [網路層監控] TCP 連線底層資訊 ===")
+        print(f"🔗 連線四元組 (4-Tuple):")
+        print(f"   [Local]  {local_ip}:{local_port}")
+        print(f"   [Remote] {remote_ip}:{remote_port}")
+        print(f"📦 TCP 緩衝區 (Buffer Size):")
+        print(f"   接收緩衝區 (SO_RCVBUF): {recv_buf} Bytes")
+        print(f"   發送緩衝區 (SO_SNDBUF): {send_buf} Bytes")
+        print(f"⚡ 延遲最佳化 (Nagle Algorithm): {nodelay_status}")
+        print("=======================================\n")
+    except Exception as e:
+        print(f"無法取得 TCP 資訊: {e}")
 SERVER_PORT = 5555
 BUFFER_SIZE = 1024
 
-# =====================================================
-# 全域狀態變數
-# player_sessions      : 字典，以玩家位址 (ip, port) 為 key，
-#                        儲存每位玩家的獨立遊戲狀態
-# total_bytes_received : 累計收到的 UDP payload 總位元組數
-# packet_count         : 累計收到的封包總數
-# start_monitor_time   : 伺服器啟動時間，用於計算平均流量速率
-# =====================================================
-player_sessions = {}  
-total_bytes_received = 0
-packet_count = 0
-start_monitor_time = time.time()
+# --- 終極系統全域狀態 ---
+# clients 存放: { socket: {"name": "Alice", "room": "Room1", "last_pong": timestamp} }
+clients = {}
+# rooms 存放: { "房名": {"players": [sock1, sock2], "active": False, "answer": "", "N": 4, "host": sock1, "start_time": 0} }
+rooms = {}
+records = {}
+
+# 為了多執行緒安全，加入 Lock
+lock = threading.Lock()
+
+# --- 戰績與邏輯功能 ---
+def load_records():
+    global records
+    if os.path.exists("tcp_records.txt"):
+        with open("tcp_records.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    parts = line.split(',')
+                    if len(parts) == 3:
+                        records[parts[0]] = {"wins": int(parts[1]), "losses": int(parts[2])}
+
+def save_records():
+    with open("tcp_records.txt", "w", encoding="utf-8") as f:
+        for name, data in records.items():
+            f.write(f"{name},{data['wins']},{data['losses']}\n")
 
 def ab(message, answer):
-    """
-    計算猜測結果，回傳 ?A?B 格式字串。
-
-    A：位置與字元都正確的數量（完全命中）
-    B：字元存在但位置不對的數量（存在但錯位）
-
-    參數：
-        message (str) : 玩家猜測的字串
-        answer  (str) : 本局謎底字串
-
-    回傳：
-        str : 例如 "1A2B"
-    """
-    n = len(answer)
     a, b = 0, 0
-    # 只比對到 min(猜測長度, 謎底長度) 的範圍，避免 index 越界
-    check_len = min(len(message), n)
+    check_len = min(len(message), len(answer))
     for i in range(check_len):
-        if message[i] == answer[i]:
-            # 位置與字元完全相同 → A+1
-            a += 1
+        if message[i] == answer[i]: a += 1
         else:
-            # 字元存在於謎底其他位置 → B+1
-            for j in range(n):
+            for j in range(len(answer)):
                 if message[i] == answer[j]: b += 1
     return f"{a}A{b}B"
 
-# =====================================================
-# 確保 records.txt 存在
-# 若檔案不存在則建立空白檔案，避免後續讀取時發生錯誤
-# =====================================================
-if not os.path.exists("records.txt"):
-    with open("records.txt", "w", encoding="utf-8") as f: pass
+def broadcast_room(room_name, message):
+    """【功能2：房間系統】只將訊息廣播給特定房間內的玩家"""
+    if room_name not in rooms: return
+    for sock in rooms[room_name]["players"]:
+        try:
+            sock.sendall(message.encode('utf-8'))
+        except:
+            pass
 
-# =====================================================
-# 建立並綁定 UDP Socket
-# bind('', PORT) 表示監聽本機所有網路介面
-# settimeout(1.0) 讓 recvfrom 每秒超時一次，
-#   使主迴圈可以定期檢查 KeyboardInterrupt 等中斷訊號
-# =====================================================
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    server_socket.bind(('', SERVER_PORT))
-    server_socket.settimeout(1.0)
-except socket.error as msg:
-    print(f"無法綁定 Socket。錯誤訊息：{msg}")
-    sys.exit()
-
-# =====================================================
-#  遊戲初始化：手動輸入第一局的題目
-# =====================================================
-print("=== 1A2B 伺服器啟動設定 ===")
-n=int(input("輸入字元數"))
-global_answer = input("請輸入第一局的正確數字/文字：").upper()
-print(f"\nUDP 伺服器啟動，監聽窗口 {SERVER_PORT} 中...\n等待玩家連線...")
-
-# =====================================================
-# 主事件迴圈
-# 持續等待並處理來自各玩家的 UDP 封包
-# 每個封包依訊息內容分流至對應的處理邏輯
-# =====================================================
-while True:
-    try:
-        # 等待接收任意玩家的封包
-        # data_bytes : 原始位元組資料
-        # address    : 來源位址 tuple (ip, port)
-        data_bytes, address = server_socket.recvfrom(BUFFER_SIZE)
-        message = data_bytes.decode('utf-8').strip()
-        
-        # ─────────────────────────────────────────────
-        # 流量監控區塊
-        # 每收到一個封包就更新統計數據並印出監控日誌
-        # ─────────────────────────────────────────────
-        # --- 流量日誌 ---
-        # --- 流量日誌 ---
-        packet_count += 1
-
-        # 應用層資料大小，也就是 UDP payload
-        payload_size = len(data_bytes)
-
-        # 累計 payload 總大小
-        total_bytes_received += payload_size
-
-        # 計算平均封包大小
-        avg_packet_size = total_bytes_received / packet_count
-
-        # 計算目前已運行時間
-        elapsed_monitor_time = time.time() - start_monitor_time
-
-        # 計算平均接收速率 Bytes/sec
-        if elapsed_monitor_time > 0:
-            bytes_per_second = total_bytes_received / elapsed_monitor_time
-        else:
-            bytes_per_second = 0
-
-        # 估算實際網路層封包大小：
-        # IPv4 header 約 20 bytes，UDP header 8 bytes
-        estimated_network_packet_size = payload_size + 20 + 8
-        estimated_total_network_bytes = total_bytes_received + packet_count * 28
-
-        print(
-            f"[流量監控] {time.strftime('%H:%M:%S')} | "
-            f"來源: {address} | "
-            f"Payload: {payload_size:3} Bytes | "
-            f"估算實際封包: {estimated_network_packet_size:3} Bytes | "
-            f"累計封包: {packet_count:2} 個 | "
-            f"累計Payload: {total_bytes_received} Bytes | "
-            f"估算總流量: {estimated_total_network_bytes} Bytes | "
-            f"平均封包: {avg_packet_size:.2f} Bytes | "
-            f"速率: {bytes_per_second:.2f} Bytes/s"
-        )
-
-        # ─────────────────────────────────────────────
-        # 新玩家初始化
-        # 若此位址尚未在 player_sessions 中，代表是新玩家
-        # 為其建立獨立的遊戲狀態：
-        #   answer : 本局謎底（使用全域設定的 global_answer）
-        #   visit  : 是否已完成敲門握手
-        #   count  : 本局猜測次數
-        # ─────────────────────────────────────────────
-        # --- 處理新玩家加入 ---
-        if address not in player_sessions:
-            player_sessions[address] = {"answer": global_answer, "visit": False, "count": 0}
-            print(f"\n[系統] 新玩家 {address} 加入了！")
-            print(f"[系統] 他的謎底為我們剛才設定的：【{global_answer}】")
-
-        # 取出該玩家的狀態物件，後續操作皆透過此參考
-        user = player_sessions[address]
-
-        # =====================================================
-        # 攔截 1：處理玩家離開
-        # 收到 QUIT / EXIT / 0 時，清除該玩家的 session 並結束
-        # =====================================================
-        if message.upper() in ['QUIT', 'EXIT', '0']:
-            print(f"\n[系統] 玩家 {address} 已中斷連線。")
-            del player_sessions[address] # 清除該玩家紀錄
-            break
-
-        # =====================================================
-        # 攔截 2：處理勝利報告與排行榜 (WIN_REPORT)
-        # 格式：WIN_REPORT,暱稱,系統時間,猜測次數,花費秒數
-        # 流程：
-        #   1. 立即回傳 ACK_OK，確認伺服器已收到戰報
-        #   2. 解析戰報內容並寫入 records.txt
-        #   3. 讀取所有紀錄，依花費時間排序
-        #   4. 組合排行榜字串（當前玩家以黃色粗體標示）
-        #   5. 將排行榜傳回給玩家
-        # =====================================================
-        if message.startswith("WIN_REPORT"):
-            # 1. 回傳 ACK 讓 Client 知道伺服器收到了
-            server_socket.sendto("ACK_OK".encode('utf-8'), address)
+# --- 【功能3：TCP 心跳偵測 (Heartbeat)】 ---
+def heartbeat_monitor():
+    """背景巡邏執行緒：每 5 秒發送 PING，超過 10 秒沒 PONG 就踢除"""
+    while True:
+        time.sleep(5)
+        current_time = time.time()
+        with lock:
+            disconnected_sockets = []
+            for sock, info in clients.items():
+                if current_time - info["last_pong"] > 10:
+                    print(f"[心跳偵測] 玩家 {info['name']} 逾時無回應，強制剔除。")
+                    disconnected_sockets.append(sock)
+                else:
+                    try:
+                        sock.sendall("PING\n".encode('utf-8'))
+                    except:
+                        disconnected_sockets.append(sock)
             
-            parts = message.split(',')
-            if len(parts) == 5:
-                r_name, r_sys_time, r_count, r_time_spent = parts[1], parts[2], parts[3], parts[4]
-                print(f"\n🎉 [戰報] {r_name} ({address}) 猜對了！共猜 {r_count} 次，花費 {r_time_spent} 秒。")
-                
-                # 將本局戰績追加寫入歷史紀錄檔
-                with open("records.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{r_name},{r_sys_time},{r_count},{r_time_spent}\n")
-                
-                # 讀取所有歷史紀錄並解析為 tuple 清單
-                # 格式：(暱稱, 系統時間, 猜測次數(int), 花費秒數(float))
-                all_records = []
-                with open("records.txt", "r", encoding="utf-8") as file:
-                    for line in file:
-                        if line.strip(): 
-                            data = line.strip().split(',')
-                            if len(data) == 4:
-                                all_records.append((data[0], data[1], int(data[2]), float(data[3])))
-                # 依花費時間（第 4 欄）由小到大排序
-                all_records.sort(key=lambda x: x[3])
-                
-                # 組合完整的排行榜字串，含表頭與分隔線
-                board_str = "\n🏆 --- 英雄榜 (按花費時間排序) --- 🏆\n"
-                board_str += "名次 | 暱稱       | 系統時間             | 次數 | 花費時間\n"
-                board_str += "-" * 55 + "\n"
-                rank = 1
-                for rec in all_records:
-                    rec_name, rec_time, rec_count, rec_spent = rec
-                    # 判斷是否為本次勝利的玩家，若是則以黃色粗體 ANSI 碼標示
-                    is_current = (rec_name == r_name and rec_time == r_sys_time and rec_count == int(r_count) and rec_spent == float(r_time_spent))
-                    row_info = f"第{rank:2}名 | {rec_name:^8} | {rec_time} | {rec_count:2}次 | {rec_spent:.2f} 秒\n"
-                    if is_current:
-                        board_str += f"\033[1m\033[93m => {row_info} \033[0m" 
-                    else:
-                        board_str += f"    {row_info}"
-                    rank += 1
-                
-                # 將完整排行榜字串傳回給該玩家
-                server_socket.sendto(board_str.encode('utf-8'), address)
-                print(f"[系統] 已將排行榜發送給 {address}，等待他決定是否重玩...")
-            continue
+            for sock in disconnected_sockets:
+                handle_disconnect(sock)
 
-        # =====================================================
-        # 攔截 3：處理重玩指令 (REPLAY)
-        # 格式：REPLAY,Y 或 REPLAY,N
-        # 若選擇 Y：管理員手動輸入下一局新謎底，重置玩家狀態
-        # 若選擇 N：清除玩家 session，結束該玩家的遊戲
-        # =====================================================
-        if message.startswith("REPLAY"):
-            choice = message.split(',')[1]
-            if choice == "Y":
-                print(f"\n[系統] 玩家 {address} 選擇再玩一次！")
-                
-                # 🚨 拔除自動產生，改為讓伺服器管理員手動輸入下一局新答案
-                new_answer = input(f" 請為該玩家輸入下一局的新謎底 (輸入 0 結束伺服器)：").upper()
-                if new_answer == '0':
-                    print("伺服器關閉中...")
-                    break
-                
-                # 更新該玩家的謎底並重置遊戲狀態
-                user["answer"] = new_answer
-                user["visit"] = False
-                user["count"] = 0
-                print(f"[系統] 已設定新謎底：【{user['answer']}】，等待玩家猜測...")
-            else:
-                # 玩家選擇不再玩，清除其 session
-                print(f"\n[系統] 玩家 {address} 結束遊戲並離開了。")
-                del player_sessions[address]
-                break
-            continue
+def handle_disconnect(sock):
+    """處理玩家斷線與退出房間的邏輯"""
+    if sock in clients:
+        room_name = clients[sock]["room"]
+        name = clients[sock]["name"]
+        
+        if room_name in rooms and sock in rooms[room_name]["players"]:
+            rooms[room_name]["players"].remove(sock)
+            broadcast_room(room_name, f"SYS,玩家 {name} 已斷線離開房間。\n")
+            
+            # 如果房間空了就刪除房間
+            if not rooms[room_name]["players"]:
+                del rooms[room_name]
+                print(f"[系統] 房間 {room_name} 已解散。")
+            # 如果房主斷線，將權限移交給下一個人 (Host Migration)
+            elif rooms[room_name]["host"] == sock:
+                rooms[room_name]["host"] = rooms[room_name]["players"][0]
+                new_host_name = clients[rooms[room_name]["host"]]["name"]
+                broadcast_room(room_name, f"SYS,房主已離開，【{new_host_name}】成為新房主。\n")
 
-        # =====================================================
-        # 正常遊戲邏輯
-        # visit=False：玩家尚未完成握手，回傳謎底位數 N
-        # visit=True ：玩家送來猜測字串，計算 ?A?B 並回傳
-        # =====================================================
-        if not user["visit"]:
-            # 玩家第一次傳來的敲門封包，回傳位數 N
-            server_socket.sendto(str(len(user["answer"])).encode('utf-8'), address)
-            user["visit"] = True
-        else:
-            # 玩家傳來猜測的數字，呼叫 ab() 計算結果後回傳
-            user["count"] += 1
-            status = ab(message, user["answer"])
-            print(f"[遊戲] {address} 猜了: {message} ➜ 結果: {status}")
-            server_socket.sendto(status.encode('utf-8'), address)
+        del clients[sock]
+        try:
+            sock.close()
+        except:
+            pass
 
-    except socket.timeout:
-        # recvfrom 超時（每秒觸發一次），繼續等待下一個封包
-        continue
+# --- 處理玩家請求 ---
+def handle_client(client_socket, addr):
+    client_socket.settimeout(None)
+    with lock:
+        clients[client_socket] = {"name": "Unknown", "room": None, "last_pong": time.time()}
+
+    try:
+        while True:
+            data = client_socket.recv(BUFFER_SIZE)
+            if not data: break
+            
+            messages = data.decode('utf-8').strip().split('\n')
+            for msg in messages:
+                if not msg: continue
+                parts = msg.split(',')
+                tag = parts[0]
+
+                # 【功能3：處理心跳回應】
+                if tag == "PONG":
+                    with lock:
+                        clients[client_socket]["last_pong"] = time.time()
+                    continue
+
+                # 初始化名字
+                if tag == "NAME":
+                    name = parts[1]
+                    with lock:
+                        clients[client_socket]["name"] = name
+                        if name not in records:
+                            records[name] = {"wins": 0, "losses": 0}
+                    client_socket.sendall("LOBBY,已連線至大廳，請創建或加入房間。\n".encode('utf-8'))
+                    continue
+
+                # 【功能2 & 4：創建房間與動態難度】
+                if tag == "CREATE":
+                    room_name, n_digits = parts[1], int(parts[2])
+                    with lock:
+                        if room_name in rooms:
+                            client_socket.sendall("SYS,該房名已存在！\n".encode('utf-8'))
+                        else:
+                            rooms[room_name] = {
+                                "players": [client_socket], "active": False,
+                                "answer": "", "N": n_digits, "host": client_socket, "start_time": 0
+                            }
+                            clients[client_socket]["room"] = room_name
+                            client_socket.sendall(f"JOINED,成功創建並加入房間 [{room_name}]，難度: {n_digits}位數\n".encode('utf-8'))
+                    continue
+
+                # 加入房間
+                if tag == "JOIN":
+                    room_name = parts[1]
+                    with lock:
+                        if room_name not in rooms:
+                            client_socket.sendall("SYS,找不到該房間！\n".encode('utf-8'))
+                        elif rooms[room_name]["active"]:
+                            client_socket.sendall("SYS,該房間遊戲已在進行中！\n".encode('utf-8'))
+                        else:
+                            rooms[room_name]["players"].append(client_socket)
+                            clients[client_socket]["room"] = room_name
+                            n_digits = rooms[room_name]["N"]
+                            client_socket.sendall(f"JOINED,成功加入房間 [{room_name}]，難度: {n_digits}位數\n".encode('utf-8'))
+                            p_name = clients[client_socket]["name"]
+                            broadcast_room(room_name, f"SYS,玩家 {p_name} 加入了房間。\n")
+
+                            # 滿兩人自動開局
+                            if len(rooms[room_name]["players"]) >= 2:
+                                pool = "0123456789ABCDEF"
+                                rooms[room_name]["answer"] = "".join(random.sample(pool, n_digits))
+                                rooms[room_name]["active"] = True
+                                rooms[room_name]["start_time"] = time.perf_counter()
+                                print(f"[系統] 房間 {room_name} 遊戲開始！謎底：{rooms[room_name]['answer']}")
+                                broadcast_room(room_name, f"START,{n_digits}位數 遊戲開始！請輸入搶答！\n")
+                    continue
+
+                # 以下指令需在房間內才能執行
+                room_name = clients[client_socket]["room"]
+                if not room_name or room_name not in rooms: continue
+                p_name = clients[client_socket]["name"]
+                room = rooms[room_name]
+
+                # 【功能1：即時聊天室】
+                if tag == "CHAT":
+                    chat_msg = parts[1]
+                    broadcast_room(room_name, f"CHAT,{p_name}: {chat_msg}\n")
+                    continue
+
+                # 處理猜測
+                if tag == "GUESS":
+                    guess = parts[1].upper()
+                    if not room["active"]:
+                        client_socket.sendall("SYS,遊戲尚未開始或已結束。\n".encode('utf-8'))
+                        continue
+                    
+                    if len(guess) != room["N"] or len(set(guess)) != room["N"]:
+                        client_socket.sendall("SYS,格式錯誤！\n".encode('utf-8'))
+                        continue
+
+                    result = ab(guess, room["answer"])
+                    client_socket.sendall(f"RES,你的猜測: {guess} ➜ {result}\n".encode('utf-8'))
+                    broadcast_room(room_name, f"CHAT,[戰況] {p_name} 猜了 {guess} ➜ {result}\n") # 用聊天室廣播戰況
+
+                    # 判斷獲勝
+                    if result == f"{room['N']}A0B":
+                        room["active"] = False
+                        elapsed_time = time.perf_counter() - room["start_time"]
+                        print(f"[系統] 房間 {room_name} 玩家 {p_name} 獲勝！")
+
+                        with lock:
+                            for sock in room["players"]:
+                                sock_name = clients[sock]["name"]
+                                if sock_name == p_name:
+                                    records[sock_name]["wins"] += 1
+                                    sock.sendall(f"OVER,WIN,{elapsed_time:.2f},{records[sock_name]['wins']},{records[sock_name]['losses']}\n".encode('utf-8'))
+                                else:
+                                    records[sock_name]["losses"] += 1
+                                    sock.sendall(f"OVER,LOSE,{p_name},{records[sock_name]['wins']},{records[sock_name]['losses']}\n".encode('utf-8'))
+                            save_records()
+                        
+                        time.sleep(0.5)
+                        broadcast_room(room_name, "SYS,--- 遊戲結束，請由房主重新創房或加入新房 ---\n")
+                        
+                        # 遊戲結束，解散房間，將玩家踢回大廳
+                        with lock:
+                            for sock in list(room["players"]):
+                                clients[sock]["room"] = None
+                                try:
+                                    sock.sendall("KICKED\n".encode('utf-8'))
+                                except: pass
+                            del rooms[room_name]
+
+    except Exception as e:
+        pass
+    finally:
+        with lock:
+            handle_disconnect(client_socket)
+
+def main():
+    load_records()
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    server_socket.bind(('', SERVER_PORT))
+    server_socket.listen(10)
+    print(f"=== TCP 終極版 競技伺服器啟動 (Port {SERVER_PORT}) ===")
+    
+    # 啟動心跳偵測執行緒
+    threading.Thread(target=heartbeat_monitor, daemon=True).start()
+
+    try:
+        while True:
+            client_socket, addr = server_socket.accept()
+            print_tcp_socket_info(client_socket, addr)
+            threading.Thread(target=handle_client, args=(client_socket, addr), daemon=True).start()
     except KeyboardInterrupt:
-        # 管理員按下 Ctrl+C，優雅地關閉伺服器
-        print("\n伺服器正在關閉...")
-        break
+        print("\n伺服器關閉中...")
+    finally:
+        server_socket.close()
+        save_records()
 
-# 關閉 Socket，釋放系統資源
-server_socket.close()
+if __name__ == "__main__":
+    main()
